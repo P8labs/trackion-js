@@ -245,7 +245,7 @@ trackion.captureError("Failed to load resource");
 ### React Error Boundaries
 
 ```tsx
-import { TrackionErrorBoundary, useCaptureError } from "@trackion/web/react";
+import { TrackionErrorBoundary, useCaptureError } from "@trackion/js/react";
 
 function MyComponent() {
   const captureError = useCaptureError();

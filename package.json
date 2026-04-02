@@ -1,5 +1,5 @@
 {
-  "name": "@trackion/web",
+  "name": "@trackion/js",
   "version": "0.0.1",
   "description": "Type-safe Trackion client SDK for web, React, Vue, and Node",
   "type": "module",
