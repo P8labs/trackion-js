@@ -41,12 +41,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/P8labs/trackion.git",
+    "url": "git+https://github.com/P8labs/trackion-js.git",
     "directory": "sdk/web"
   },
   "homepage": "https://trackion.tech/docs/javascript-api/",
   "bugs": {
-    "url": "https://github.com/P8labs/trackion/issues"
+    "url": "https://github.com/P8labs/trackion-js/issues"
   },
   "keywords": [
     "trackion",
