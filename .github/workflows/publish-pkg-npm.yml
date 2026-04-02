@@ -50,7 +50,6 @@ jobs:
           fi
 
       - name: Publish package
-        env:
         run: npm publish --access public --provenance
 
       - name: Create GitHub Release
