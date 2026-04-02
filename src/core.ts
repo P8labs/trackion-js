@@ -49,7 +49,6 @@ export interface TrackionPageOptions extends TrackionPageContext {
 export interface TrackionClientOptions {
   serverUrl: string;
   apiKey: string;
-  projectId?: string;
   autoPageview?: boolean;
   batchSize?: number;
   flushIntervalMs?: number;
@@ -200,7 +199,7 @@ async function postBatch(
   serverUrl: string,
   apiKey: string,
   events: EventPayload[],
-  useBeacon: boolean,
+  _useBeacon: boolean,
 ): Promise<void> {
   const payload = {
     project_key: apiKey,
@@ -208,18 +207,6 @@ async function postBatch(
   };
 
   const endpoint = `${serverUrl}/events/batch`;
-
-  if (
-    useBeacon &&
-    typeof navigator !== "undefined" &&
-    typeof navigator.sendBeacon === "function"
-  ) {
-    const blob = new Blob([JSON.stringify(payload)], {
-      type: "application/json",
-    });
-    navigator.sendBeacon(endpoint, blob);
-    return;
-  }
 
   const response = await fetch(endpoint, {
     method: "POST",
@@ -241,7 +228,6 @@ async function postBatch(
 
 export class TrackionClient {
   private readonly apiKey: string;
-  private readonly projectId: string;
   private readonly serverUrl: string;
   private readonly autoPageview: boolean;
   private readonly batchSize: number;
@@ -289,7 +275,6 @@ export class TrackionClient {
     }
 
     this.apiKey = options.apiKey;
-    this.projectId = options.projectId || "";
     this.serverUrl = normalizeServerUrl(options.serverUrl);
     this.autoPageview = options.autoPageview !== false;
     this.batchSize =
@@ -309,8 +294,8 @@ export class TrackionClient {
       typeof options.userId === "string" ? options.userId.trim() : "";
 
     this.sessionId = getOrCreateSessionId(options.sessionId);
-    this.runtimeStorageKey = this.projectId
-      ? `trackion.runtime.${this.projectId}`
+    this.runtimeStorageKey = this.apiKey
+      ? `trackion.runtime.${this.apiKey}`
       : "";
 
     this._hydrateRuntimeFromStorage();

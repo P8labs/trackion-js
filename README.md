@@ -9,35 +9,24 @@ Official client-side SDK for Trackion with first-class TypeScript support for:
 ## Install
 
 ```bash
-npm install @trackion/web
+npm install @trackion/js
 ```
 
 ## Package Entrypoints
 
-- Core (vanilla): `@trackion/web`
-- React helpers: `@trackion/web/react`
-- Vue helpers: `@trackion/web/vue`
-- Node helpers: `@trackion/web/node`
-
-## Examples
-
-Practical integration examples are available in:
-
-- `examples/web/index.ts`
-- `examples/react/App.tsx`
-- `examples/vue/main.ts`
-- `examples/node/index.ts`
-- `examples/script/index.html`
+- Core (vanilla): `@trackion/js`
+- React helpers: `@trackion/js/react`
+- Vue helpers: `@trackion/js/vue`
+- Node helpers: `@trackion/js/node`
 
 ## Vanilla Usage
 
 ```ts
-import { createTrackionClient } from "@trackion/web";
+import { createTrackionClient } from "@trackion/js";
 
 const trackion = createTrackionClient({
   serverUrl: "https://api.trackion.tech",
   apiKey: "YOUR_API_KEY",
-  projectId: "PROJECT_UUID",
   userId: "user-123",
   autoPageview: true,
 });
@@ -47,7 +36,6 @@ trackion.track("signup.started", { source: "landing" });
 await trackion.refreshRuntime();
 
 if (trackion.isEnabled("checkout_v2")) {
-  // render new checkout flow
 }
 
 const paywall = trackion.getConfig<{ title: string; cta: string }>(
@@ -64,7 +52,7 @@ import {
   useTrackion,
   useFeatureFlag,
   useRemoteConfig,
-} from "@trackion/web/react";
+} from "@trackion/js/react";
 
 function UpgradeButton() {
   const trackion = useTrackion();
@@ -90,7 +78,6 @@ export function App() {
       options={{
         serverUrl: "https://api.trackion.tech",
         apiKey: "YOUR_API_KEY",
-        projectId: "PROJECT_UUID",
         userId: "user-123",
       }}
     >
@@ -106,14 +93,13 @@ export function App() {
 // main.ts
 import { createApp } from "vue";
 import App from "./App.vue";
-import { createVueTrackion, provideTrackion } from "@trackion/web/vue";
+import { createVueTrackion, provideTrackion } from "@trackion/js/vue";
 
 const app = createApp({
   setup() {
     const client = createVueTrackion({
       serverUrl: "https://api.trackion.tech",
       apiKey: "YOUR_API_KEY",
-      projectId: "PROJECT_UUID",
       userId: "user-123",
     });
 
@@ -127,11 +113,7 @@ app.mount("#app");
 
 ```ts
 // Any component setup()
-import {
-  useTrackion,
-  useFeatureFlag,
-  useRemoteConfig,
-} from "@trackion/web/vue";
+import { useTrackion, useFeatureFlag, useRemoteConfig } from "@trackion/js/vue";
 
 const trackion = useTrackion();
 const checkoutV2 = useFeatureFlag("checkout_v2");
@@ -147,12 +129,11 @@ function onClick() {
 ## Node Usage
 
 ```ts
-import { createTrackionNodeClient, trackServerEvent } from "@trackion/web/node";
+import { createTrackionNodeClient, trackServerEvent } from "@trackion/js/node";
 
 const trackion = createTrackionNodeClient({
   serverUrl: "https://api.trackion.tech",
   apiKey: "YOUR_API_KEY",
-  projectId: "PROJECT_UUID",
   userId: "server-user-123",
 });
 
@@ -174,7 +155,6 @@ Creates and starts a client.
 
 - `serverUrl` (required): API base URL.
 - `apiKey` (required): Authentication API key.
-- `projectId` (optional): UUID used for runtime fetch (`/v1/runtime`).
 - `autoPageview` (optional, default `true`).
 - `batchSize` (optional, default `20`).
 - `flushIntervalMs` (optional, default `5000`).
@@ -221,7 +201,7 @@ Trackion automatically captures device and browser information with every event:
 }
 
 // Access device info directly:
-import { getDeviceInfo } from "@trackion/web";
+import { getDeviceInfo } from "@trackion/js";
 const deviceInfo = getDeviceInfo();
 ```
 
@@ -254,8 +234,8 @@ trackion.captureError(new Error("Something went wrong"));
 // With additional context
 trackion.captureError(error, {
   userId: "user123",
-  feature: "checkout", 
-  step: "payment"
+  feature: "checkout",
+  step: "payment",
 });
 
 // Capture string errors
@@ -269,7 +249,7 @@ import { TrackionErrorBoundary, useCaptureError } from "@trackion/web/react";
 
 function MyComponent() {
   const captureError = useCaptureError();
-  
+
   const handleSubmit = async () => {
     try {
       await submitForm();
@@ -278,7 +258,7 @@ function MyComponent() {
       throw error; // Re-throw to handle in UI
     }
   };
-  
+
   return <form onSubmit={handleSubmit}>...</form>;
 }
 
@@ -307,7 +287,7 @@ The SDK automatically filters out noise:
 
 // Custom filtering can be added via context:
 trackion.captureError(error, {
-  skipCapture: shouldIgnoreError(error)
+  skipCapture: shouldIgnoreError(error),
 });
 ```
 
@@ -324,6 +304,7 @@ trackion.captureError(new Error("Same error")); // Deduplicated
 ### Error Grouping
 
 Errors are grouped by fingerprint in the dashboard:
+
 - Fingerprint = SHA256(error message + first line of stack trace)
 - Same errors across different users/sessions are grouped together
 - View error counts, first/last occurrence, and individual stack traces
