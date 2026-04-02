@@ -78,7 +78,7 @@ node -e "const fs=require('fs');const p='$SDK_PACKAGE_JSON';const data=JSON.pars
 
 echo "SDK version: $CURRENT_VERSION -> $NEW_VERSION"
 
-git -C "$REPO_ROOT" add package.json
+git -C "$REPO_ROOT" add .
 
 git -C "$REPO_ROOT" commit -m "chore(sdk): release @trackion/js v$NEW_VERSION"
 
