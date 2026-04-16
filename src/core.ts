@@ -46,6 +46,11 @@ export interface TrackionPageOptions extends TrackionPageContext {
   properties?: Record<string, TrackionJSON>;
 }
 
+export interface TrackionReplayOptions {
+  enabled?: boolean;
+  sampleRate?: number;
+}
+
 export interface TrackionClientOptions {
   serverUrl: string;
   apiKey: string;
@@ -55,6 +60,7 @@ export interface TrackionClientOptions {
   sessionId?: string;
   userId?: string;
   runtimeTTLms?: number;
+  replay?: TrackionReplayOptions;
 }
 
 export interface RefreshRuntimeOptions {
@@ -92,11 +98,26 @@ interface EventPayload {
   timestamp: string;
 }
 
+interface ReplayPayload {
+  projectId: string;
+  sessionId: string;
+  events: unknown[];
+}
+
 const DEFAULT_BATCH_SIZE = 20;
 const DEFAULT_FLUSH_INTERVAL_MS = 5000;
 const DEFAULT_RUNTIME_TTL_MS = 60_000;
+const DEFAULT_REPLAY_SAMPLE_RATE = 1;
+const REPLAY_FLUSH_INTERVAL_MS = 2000;
+const REPLAY_MAX_BUFFER_EVENTS = 5000;
+const REPLAY_MAX_DURATION_MS = 10 * 60 * 1000;
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const SESSION_STORAGE_KEY = "trackion.session";
+
+interface SessionStorageRecord {
+  id: string;
+  exp: number;
+}
 
 const EVENTS = {
   PAGE_VIEW: "page.view",
@@ -111,6 +132,26 @@ type TrackingConfig = {
   trackTimeSpent: boolean;
   trackClicks: boolean;
 };
+
+type ReplayConfig = {
+  enabled: boolean;
+  sampleRate: number;
+};
+
+type ReplayControl = {
+  start: () => void;
+  stop: () => void;
+};
+
+type RRWebEmit = (event: unknown) => void;
+type RRWebStopFn = () => void;
+type RRWebRecordFn = (options: {
+  emit: RRWebEmit;
+  maskAllInputs: boolean;
+  blockClass: string;
+  maskTextClass: string;
+  sampling: { mousemove: boolean | number };
+}) => RRWebStopFn;
 
 function randomId(): string {
   if (
@@ -131,41 +172,66 @@ function normalizeServerUrl(serverUrl: string): string {
   return serverUrl.replace(/\/+$/, "");
 }
 
-function getOrCreateSessionId(seed?: string): string {
-  if (seed && typeof seed === "string") {
-    return seed;
+function persistSessionId(sessionId: string): void {
+  if (typeof localStorage === "undefined") {
+    return;
   }
 
+  try {
+    const payload: SessionStorageRecord = {
+      id: sessionId,
+      exp: Date.now() + SESSION_TTL_MS,
+    };
+    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // Ignore storage write failures.
+  }
+}
+
+function readSessionRecord(): SessionStorageRecord | null {
   if (typeof localStorage === "undefined") {
-    return randomId();
+    return null;
   }
 
   try {
     const raw = localStorage.getItem(SESSION_STORAGE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw) as { id?: string; exp?: number } | null;
-      if (
-        parsed &&
-        typeof parsed.id === "string" &&
-        typeof parsed.exp === "number" &&
-        Date.now() < parsed.exp
-      ) {
-        return parsed.id;
-      }
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(raw) as { id?: string; exp?: number } | null;
+    if (
+      parsed &&
+      typeof parsed.id === "string" &&
+      typeof parsed.exp === "number"
+    ) {
+      return {
+        id: parsed.id,
+        exp: parsed.exp,
+      };
     }
   } catch {
-    // Ignore malformed session cache and recreate below.
+    // Ignore malformed session cache.
+  }
+
+  return null;
+}
+
+function getOrCreateSessionId(seed?: string): string {
+  if (seed && typeof seed === "string") {
+    persistSessionId(seed);
+    return seed;
+  }
+
+  const existing = readSessionRecord();
+  if (existing && Date.now() < existing.exp) {
+    // Renew TTL for active sessions to avoid unnecessary churn.
+    persistSessionId(existing.id);
+    return existing.id;
   }
 
   const id = randomId();
-  try {
-    localStorage.setItem(
-      SESSION_STORAGE_KEY,
-      JSON.stringify({ id, exp: Date.now() + SESSION_TTL_MS }),
-    );
-  } catch {
-    // Ignore storage write failures.
-  }
+  persistSessionId(id);
 
   return id;
 }
@@ -208,7 +274,36 @@ async function postBatch(
 
   const endpoint = `${serverUrl}/events/batch`;
 
-  const response = await fetch(endpoint, {
+  const response = await postJSON(endpoint, apiKey, payload);
+
+  if (!response.ok) {
+    throw new Error(
+      `Trackion SDK: request failed with status ${response.status}`,
+    );
+  }
+}
+
+async function postReplay(
+  serverUrl: string,
+  apiKey: string,
+  payload: ReplayPayload,
+): Promise<void> {
+  const endpoint = `${serverUrl}/replay`;
+  const response = await postJSON(endpoint, apiKey, payload);
+
+  if (!response.ok) {
+    throw new Error(
+      `Trackion SDK: replay request failed with status ${response.status}`,
+    );
+  }
+}
+
+async function postJSON(
+  endpoint: string,
+  apiKey: string,
+  payload: unknown,
+): Promise<Response> {
+  return fetch(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -218,11 +313,189 @@ async function postBatch(
     body: JSON.stringify(payload),
     keepalive: true,
   });
+}
 
-  if (!response.ok) {
-    throw new Error(
-      `Trackion SDK: request failed with status ${response.status}`,
+class ReplayRecorder {
+  private readonly apiKey: string;
+  private readonly serverUrl: string;
+  private readonly getSessionId: () => string;
+  private readonly config: ReplayConfig;
+
+  private buffer: unknown[] = [];
+  private flushTimer: ReturnType<typeof setInterval> | null = null;
+  private stopRecording: RRWebStopFn | null = null;
+  private maxDurationTimer: ReturnType<typeof setTimeout> | null = null;
+  private started = false;
+  private sampledIn = false;
+  private loading = false;
+  private limitWindowStartedAt = 0;
+  private limitReached = false;
+  private activeSessionId = "";
+
+  constructor(options: {
+    apiKey: string;
+    serverUrl: string;
+    getSessionId: () => string;
+    config: ReplayConfig;
+  }) {
+    this.apiKey = options.apiKey;
+    this.serverUrl = options.serverUrl;
+    this.getSessionId = options.getSessionId;
+    this.config = options.config;
+  }
+
+  start(): void {
+    const sessionId = this.getSessionId();
+    this._syncSessionState(sessionId);
+
+    if (this.started || !this._canStart() || this.limitReached) {
+      return;
+    }
+
+    if (!this.sampledIn) {
+      this.sampledIn = Math.random() < this.config.sampleRate;
+    }
+
+    if (!this.sampledIn || this.loading) {
+      return;
+    }
+
+    this.loading = true;
+    void this._startRecorder().finally(() => {
+      this.loading = false;
+    });
+  }
+
+  stop(): void {
+    if (this.stopRecording) {
+      this.stopRecording();
+      this.stopRecording = null;
+    }
+
+    if (this.maxDurationTimer) {
+      clearTimeout(this.maxDurationTimer);
+      this.maxDurationTimer = null;
+    }
+
+    if (this.flushTimer) {
+      clearInterval(this.flushTimer);
+      this.flushTimer = null;
+    }
+
+    void this.flush();
+    this.started = false;
+  }
+
+  flush(): Promise<void> {
+    if (this.buffer.length === 0) {
+      return Promise.resolve();
+    }
+
+    const events = this.buffer.slice();
+    const payload: ReplayPayload = {
+      projectId: this.apiKey,
+      sessionId: this.getSessionId(),
+      events,
+    };
+
+    return postReplay(this.serverUrl, this.apiKey, payload)
+      .then(() => {
+        this.buffer.length = 0;
+      })
+      .catch(() => {
+        // Keep buffer for next retry on transient failures.
+      });
+  }
+
+  private _canStart(): boolean {
+    return (
+      this.config.enabled &&
+      typeof window !== "undefined" &&
+      typeof document !== "undefined"
     );
+  }
+
+  private async _startRecorder(): Promise<void> {
+    const record = await this._loadRecord();
+    if (!record || this.stopRecording) {
+      return;
+    }
+
+    const remainingMs = this._remainingLimitMs();
+    if (remainingMs <= 0) {
+      this.limitReached = true;
+      return;
+    }
+
+    this.stopRecording = record({
+      emit: (event) => {
+        if (this._remainingLimitMs() <= 0) {
+          this._stopForLimit();
+          return;
+        }
+
+        this.buffer.push(event);
+        if (this.buffer.length > REPLAY_MAX_BUFFER_EVENTS) {
+          this.buffer.splice(0, this.buffer.length - REPLAY_MAX_BUFFER_EVENTS);
+        }
+      },
+      maskAllInputs: true,
+      blockClass: "trk-block",
+      maskTextClass: "trk-mask",
+      sampling: {
+        mousemove: 50,
+      },
+    });
+
+    this.flushTimer = setInterval(() => {
+      void this.flush();
+    }, REPLAY_FLUSH_INTERVAL_MS);
+
+    this.maxDurationTimer = setTimeout(() => {
+      this._stopForLimit();
+    }, remainingMs);
+
+    this.started = true;
+  }
+
+  private _syncSessionState(sessionId: string): void {
+    if (this.activeSessionId === sessionId) {
+      return;
+    }
+
+    this.activeSessionId = sessionId;
+    this.sampledIn = false;
+    this.limitReached = false;
+    this.limitWindowStartedAt = 0;
+  }
+
+  private _remainingLimitMs(): number {
+    if (!this.limitWindowStartedAt) {
+      this.limitWindowStartedAt = Date.now();
+    }
+
+    const elapsed = Date.now() - this.limitWindowStartedAt;
+    return Math.max(0, REPLAY_MAX_DURATION_MS - elapsed);
+  }
+
+  private _stopForLimit(): void {
+    if (this.limitReached) {
+      return;
+    }
+
+    this.limitReached = true;
+    this.stop();
+  }
+
+  private async _loadRecord(): Promise<RRWebRecordFn | null> {
+    try {
+      const rrweb = (await import("rrweb")) as {
+        record?: RRWebRecordFn;
+      };
+      return rrweb.record || null;
+    } catch {
+      return null;
+    }
   }
 }
 
@@ -234,6 +507,7 @@ export class TrackionClient {
   private readonly flushIntervalMs: number;
   private readonly runtimeTTLms: number;
   private readonly runtimeStorageKey: string;
+  private readonly replayRecorder: ReplayRecorder;
 
   private userId: string;
   private queue: EventPayload[] = [];
@@ -245,6 +519,8 @@ export class TrackionClient {
   private pageStartedAt = Date.now();
   private lastLeaveAt = 0;
   private lastHeartbeatAt = 0;
+
+  public readonly replay: ReplayControl;
 
   private runtime: RuntimePayload = {
     flags: {},
@@ -293,10 +569,34 @@ export class TrackionClient {
     this.userId =
       typeof options.userId === "string" ? options.userId.trim() : "";
 
+    const replayConfig: ReplayConfig = {
+      enabled: Boolean(options.replay?.enabled),
+      sampleRate:
+        typeof options.replay?.sampleRate === "number" &&
+        Number.isFinite(options.replay.sampleRate)
+          ? Math.max(0, Math.min(1, options.replay.sampleRate))
+          : DEFAULT_REPLAY_SAMPLE_RATE,
+    };
+
     this.sessionId = getOrCreateSessionId(options.sessionId);
     this.runtimeStorageKey = this.apiKey
       ? `trackion.runtime.${this.apiKey}`
       : "";
+
+    this.replayRecorder = new ReplayRecorder({
+      apiKey: this.apiKey,
+      serverUrl: this.serverUrl,
+      getSessionId: () => this.sessionId,
+      config: replayConfig,
+    });
+    this.replay = {
+      start: () => {
+        this.replayRecorder.start();
+      },
+      stop: () => {
+        this.replayRecorder.stop();
+      },
+    };
 
     this._hydrateRuntimeFromStorage();
     this._setupErrorHandlers();
@@ -362,9 +662,12 @@ export class TrackionClient {
 
       window.addEventListener("pagehide", this._onPageHide);
       window.addEventListener("beforeunload", this._onPageHide);
+      window.addEventListener("beforeunload", this._onReplayBeforeUnload);
       document.addEventListener("visibilitychange", this._onVisibilityChange);
       document.addEventListener("click", this._onTrackedClick);
     }
+
+    this.replayRecorder.start();
 
     if (this._getTrackingConfig().autoPageview) {
       this.page();
@@ -379,6 +682,8 @@ export class TrackionClient {
   }
 
   shutdown(): void {
+    this.replayRecorder.stop();
+
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
@@ -392,6 +697,7 @@ export class TrackionClient {
     if (typeof window !== "undefined") {
       window.removeEventListener("pagehide", this._onPageHide);
       window.removeEventListener("beforeunload", this._onPageHide);
+      window.removeEventListener("beforeunload", this._onReplayBeforeUnload);
       document.removeEventListener(
         "visibilitychange",
         this._onVisibilityChange,
@@ -417,18 +723,13 @@ export class TrackionClient {
       throw new Error("Trackion SDK: sessionId must be a non-empty string");
     }
 
-    this.sessionId = sessionId;
-
-    if (typeof localStorage !== "undefined") {
-      try {
-        localStorage.setItem(
-          SESSION_STORAGE_KEY,
-          JSON.stringify({ id: sessionId, exp: Date.now() + SESSION_TTL_MS }),
-        );
-      } catch {
-        // Ignore storage write failures.
-      }
+    const nextSessionId = sessionId.trim();
+    if (!nextSessionId) {
+      throw new Error("Trackion SDK: sessionId must be a non-empty string");
     }
+
+    this.sessionId = nextSessionId;
+    persistSessionId(this.sessionId);
   }
 
   setUserId(userId: string): void {
@@ -753,6 +1054,10 @@ export class TrackionClient {
       this._trackPageLeave();
       void this.flush({ useBeacon: true });
     }
+  };
+
+  private _onReplayBeforeUnload = (): void => {
+    this.replayRecorder.stop();
   };
 
   private _onTrackedClick = (event: MouseEvent): void => {

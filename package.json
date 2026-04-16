@@ -74,6 +74,9 @@
       "optional": true
     }
   },
+  "dependencies": {
+    "rrweb": "^2.0.0-alpha.18"
+  },
   "devDependencies": {
     "@types/react": "^19.1.5",
     "typescript": "^5.8.3",
