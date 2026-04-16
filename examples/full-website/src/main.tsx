@@ -1,3 +1,4 @@
+import type { TrackionClientOptions } from "@trackion/js";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
@@ -63,13 +64,16 @@ function ErrorFallback() {
   );
 }
 
-const trackionConfig = {
+const trackionConfig: TrackionClientOptions = {
   serverUrl: "http://localhost:8000", // Update this to your Trackion server
-  apiKey: "fe05b2f6-5532-5353-bf0a-dd6f9861680b", // Update this to your API key
+  apiKey: "439e7cbd-0461-5ef5-9e87-9d31db35a617", // Update this to your API key
   userId: "demo_user",
   autoPageview: true,
   batchSize: 10,
   flushIntervalMs: 3000,
+  replay: {
+    enabled: true,
+  },
 };
 
 ReactDOM.createRoot(document.getElementById("root")!).render(

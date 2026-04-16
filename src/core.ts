@@ -99,8 +99,8 @@ interface EventPayload {
 }
 
 interface ReplayPayload {
-  projectId: string;
-  sessionId: string;
+  project_key: string;
+  session_id: string;
   events: unknown[];
 }
 
@@ -111,8 +111,17 @@ const DEFAULT_REPLAY_SAMPLE_RATE = 1;
 const REPLAY_FLUSH_INTERVAL_MS = 2000;
 const REPLAY_MAX_BUFFER_EVENTS = 5000;
 const REPLAY_MAX_DURATION_MS = 10 * 60 * 1000;
+const REPLAY_MOUSEMOVE_SAMPLING_MS = 120;
+const REPLAY_IDLE_START_DELAY_MS = 500;
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const SESSION_STORAGE_KEY = "trackion.session";
+
+let cachedUTMSearch = "";
+let cachedUTM: Required<TrackionUTMContext> = {
+  source: "",
+  medium: "",
+  campaign: "",
+};
 
 interface SessionStorageRecord {
   id: string;
@@ -253,12 +262,20 @@ function getCurrentUTM(): Required<TrackionUTMContext> {
     return { source: "", medium: "", campaign: "" };
   }
 
-  const params = new URLSearchParams(window.location?.search || "");
-  return {
+  const search = window.location?.search || "";
+  if (search === cachedUTMSearch) {
+    return cachedUTM;
+  }
+
+  const params = new URLSearchParams(search);
+  cachedUTMSearch = search;
+  cachedUTM = {
     source: params.get("utm_source") || "",
     medium: params.get("utm_medium") || "",
     campaign: params.get("utm_campaign") || "",
   };
+
+  return cachedUTM;
 }
 
 async function postBatch(
@@ -325,6 +342,7 @@ class ReplayRecorder {
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private stopRecording: RRWebStopFn | null = null;
   private maxDurationTimer: ReturnType<typeof setTimeout> | null = null;
+  private flushing = false;
   private started = false;
   private sampledIn = false;
   private loading = false;
@@ -386,25 +404,33 @@ class ReplayRecorder {
     this.started = false;
   }
 
-  flush(): Promise<void> {
-    if (this.buffer.length === 0) {
+  async flush(): Promise<void> {
+    if (this.flushing || this.buffer.length === 0) {
       return Promise.resolve();
     }
 
-    const events = this.buffer.slice();
+    this.flushing = true;
+
+    const events = this.buffer.splice(0, this.buffer.length);
     const payload: ReplayPayload = {
-      projectId: this.apiKey,
-      sessionId: this.getSessionId(),
+      project_key: this.apiKey,
+      session_id: this.getSessionId(),
       events,
     };
 
-    return postReplay(this.serverUrl, this.apiKey, payload)
-      .then(() => {
-        this.buffer.length = 0;
-      })
-      .catch(() => {
-        // Keep buffer for next retry on transient failures.
-      });
+    try {
+      try {
+        return await postReplay(this.serverUrl, this.apiKey, payload);
+      } catch {
+        // Requeue failed events ahead of newly captured ones.
+        this.buffer = events.concat(this.buffer);
+      }
+    } finally {
+      this.flushing = false;
+      if (this.started && this.buffer.length > 0) {
+        void this.flush();
+      }
+    }
   }
 
   private _canStart(): boolean {
@@ -443,7 +469,7 @@ class ReplayRecorder {
       blockClass: "trk-block",
       maskTextClass: "trk-mask",
       sampling: {
-        mousemove: 50,
+        mousemove: REPLAY_MOUSEMOVE_SAMPLING_MS,
       },
     });
 
@@ -508,6 +534,10 @@ export class TrackionClient {
   private readonly runtimeTTLms: number;
   private readonly runtimeStorageKey: string;
   private readonly replayRecorder: ReplayRecorder;
+  private readonly deviceInfo = getEventDeviceInfo();
+  private readonly userAgent =
+    typeof navigator !== "undefined" ? navigator.userAgent : "";
+  private replayStartTimer: ReturnType<typeof setTimeout> | null = null;
 
   private userId: string;
   private queue: EventPayload[] = [];
@@ -667,7 +697,7 @@ export class TrackionClient {
       document.addEventListener("click", this._onTrackedClick);
     }
 
-    this.replayRecorder.start();
+    this._scheduleReplayStart();
 
     if (this._getTrackingConfig().autoPageview) {
       this.page();
@@ -682,6 +712,11 @@ export class TrackionClient {
   }
 
   shutdown(): void {
+    if (this.replayStartTimer) {
+      clearTimeout(this.replayStartTimer);
+      this.replayStartTimer = null;
+    }
+
     this.replayRecorder.stop();
 
     if (this.timer) {
@@ -751,7 +786,7 @@ export class TrackionClient {
 
     const page = getCurrentPage();
     const utm = getCurrentUTM();
-    const deviceInfo = getEventDeviceInfo();
+    const deviceInfo = this.deviceInfo;
 
     // Merge user properties with device information
     const enrichedProperties = {
@@ -763,15 +798,12 @@ export class TrackionClient {
       ...properties, // User properties take precedence
     };
 
-    const userAgent =
-      typeof navigator !== "undefined" ? navigator.userAgent : "";
-
     this._enqueue({
       project_key: this.apiKey,
       event: eventName,
       session_id: context.sessionId || this.sessionId,
       user_id: this.userId || undefined,
-      user_agent: userAgent,
+      user_agent: this.userAgent,
       device: String(deviceInfo.device || ""),
       platform: String(deviceInfo.platform || ""),
       browser: String(deviceInfo.browser || ""),
@@ -793,7 +825,7 @@ export class TrackionClient {
   page(data: TrackionPageOptions = {}): void {
     const page = getCurrentPage();
     const utm = getCurrentUTM();
-    const deviceInfo = getEventDeviceInfo();
+    const deviceInfo = this.deviceInfo;
 
     // Merge user properties with device information
     const enrichedProperties = {
@@ -805,15 +837,12 @@ export class TrackionClient {
       ...(data.properties || {}), // User properties take precedence
     };
 
-    const userAgent =
-      typeof navigator !== "undefined" ? navigator.userAgent : "";
-
     this._enqueue({
       project_key: this.apiKey,
       event: EVENTS.PAGE_VIEW,
       session_id: this.sessionId,
       user_id: this.userId || undefined,
-      user_agent: userAgent,
+      user_agent: this.userAgent,
       device: String(deviceInfo.device || ""),
       platform: String(deviceInfo.platform || ""),
       browser: String(deviceInfo.browser || ""),
@@ -898,7 +927,7 @@ export class TrackionClient {
       // Track the error event with type="error"
       const page = getCurrentPage();
       const utm = getCurrentUTM();
-      const deviceInfo = getEventDeviceInfo();
+      const deviceInfo = this.deviceInfo;
 
       // Merge device info with error metadata
       const enrichedErrorMetadata = {
@@ -906,16 +935,13 @@ export class TrackionClient {
         ...errorMetadata, // Error metadata takes precedence
       };
 
-      const userAgent =
-        typeof navigator !== "undefined" ? navigator.userAgent : "";
-
       this._enqueue({
         project_key: this.apiKey,
         event: "error",
         type: "error",
         session_id: this.sessionId,
         user_id: this.userId || undefined,
-        user_agent: userAgent,
+        user_agent: this.userAgent,
         device: String(deviceInfo.device || ""),
         platform: String(deviceInfo.platform || ""),
         browser: String(deviceInfo.browser || ""),
@@ -1079,9 +1105,44 @@ export class TrackionClient {
     this.track(EVENTS.CLICK, {
       tag: el.tagName,
       id: el.id || null,
-      text: (el.innerText || "").slice(0, 50),
+      text: (el.textContent || "").slice(0, 50),
     });
   };
+
+  private _scheduleReplayStart(): void {
+    if (typeof window === "undefined") {
+      this.replayRecorder.start();
+      return;
+    }
+
+    const idleWindow = window as Window & {
+      requestIdleCallback?: (
+        callback: () => void,
+        options?: { timeout: number },
+      ) => number;
+    };
+
+    if (typeof idleWindow.requestIdleCallback === "function") {
+      idleWindow.requestIdleCallback(
+        () => {
+          if (!this.started) {
+            return;
+          }
+          this.replayRecorder.start();
+        },
+        { timeout: 1000 },
+      );
+      return;
+    }
+
+    this.replayStartTimer = setTimeout(() => {
+      this.replayStartTimer = null;
+      if (!this.started) {
+        return;
+      }
+      this.replayRecorder.start();
+    }, REPLAY_IDLE_START_DELAY_MS);
+  }
 
   private _trackPageLeave(): void {
     const now = Date.now();

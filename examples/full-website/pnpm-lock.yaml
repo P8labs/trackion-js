@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@trackion/js':
-        specifier: ^0.0.2
-        version: 0.0.2(react@18.3.1)
+        specifier: ../../.
+        version: link:../..
       lucide-react:
         specifier: ^0.577.0
         version: 0.577.0(react@18.3.1)
@@ -513,18 +513,6 @@ packages:
     resolution: {integrity: sha512-lWMnixq/QzxyhTV6NjQJ4SFo1J6PvOX8vUx5Wb4bBPsEb+8xZ89Bz6kOXpfXj9ak9AHTQVQzlgzBEc1SyM27xQ==}
     cpu: [x64]
     os: [win32]
-
-  '@trackion/js@0.0.2':
-    resolution: {integrity: sha512-5jKnp4oumVvey9gm9WLmFV6kmcGAxFb84WOq5ojOZbtgBX+iavHMJX/uBhfPhyGUnp+44ChAbg0QFLf1aHh/ng==}
-    engines: {node: '>=18'}
-    peerDependencies:
-      react: '>=18'
-      vue: '>=3.3'
-    peerDependenciesMeta:
-      react:
-        optional: true
-      vue:
-        optional: true
 
   '@types/babel__core@7.20.5':
     resolution: {integrity: sha512-qoQprZvz5wQFJwMDqeseRXWv3rqMvhgpbXFfVyWhbx9X47POIA6i/+dXefEmZKoAgOaTdaIgNSMqMIU61yRyzA==}
@@ -1480,10 +1468,6 @@ snapshots:
 
   '@rollup/rollup-win32-x64-msvc@4.60.1':
     optional: true
-
-  '@trackion/js@0.0.2(react@18.3.1)':
-    optionalDependencies:
-      react: 18.3.1
 
   '@types/babel__core@7.20.5':
     dependencies:
