@@ -52,7 +52,8 @@ export interface TrackionReplayOptions {
 }
 
 export interface TrackionClientOptions {
-  serverUrl: string;
+  enabled?: boolean;
+  serverUrl?: string;
   apiKey: string;
   autoPageview?: boolean;
   batchSize?: number;
@@ -526,6 +527,7 @@ class ReplayRecorder {
 }
 
 export class TrackionClient {
+  private readonly enabled: boolean;
   private readonly apiKey: string;
   private readonly serverUrl: string;
   private readonly autoPageview: boolean;
@@ -580,8 +582,11 @@ export class TrackionClient {
       throw new Error("Trackion SDK: apiKey is required");
     }
 
+    this.enabled = options.enabled || true;
     this.apiKey = options.apiKey;
-    this.serverUrl = normalizeServerUrl(options.serverUrl);
+    this.serverUrl = normalizeServerUrl(
+      options.serverUrl || "https://api.trackion.tech",
+    );
     this.autoPageview = options.autoPageview !== false;
     this.batchSize =
       Number.isInteger(options.batchSize) && (options.batchSize ?? 0) > 0
@@ -1059,6 +1064,7 @@ export class TrackionClient {
   }
 
   private _enqueue(event: EventPayload): void {
+    if (!this.enabled) return;
     this.queue.push(event);
 
     if (this.queue.length >= this.batchSize) {
