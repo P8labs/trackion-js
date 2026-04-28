@@ -7,6 +7,7 @@ import {
   ErrorDeduplicator,
 } from "./errors";
 import { getEventDeviceInfo } from "./device";
+import { ReplayRecorder, type ReplayControl } from "./replay";
 
 export type { ErrorContext };
 export { type DeviceInfo, getDeviceInfo } from "./device";
@@ -62,6 +63,7 @@ export interface TrackionClientOptions {
   userId?: string;
   runtimeTTLms?: number;
   replay?: TrackionReplayOptions;
+  debug?: boolean;
 }
 
 export interface RefreshRuntimeOptions {
@@ -109,13 +111,29 @@ const DEFAULT_BATCH_SIZE = 20;
 const DEFAULT_FLUSH_INTERVAL_MS = 5000;
 const DEFAULT_RUNTIME_TTL_MS = 60_000;
 const DEFAULT_REPLAY_SAMPLE_RATE = 1;
-const REPLAY_FLUSH_INTERVAL_MS = 2000;
-const REPLAY_MAX_BUFFER_EVENTS = 5000;
-const REPLAY_MAX_DURATION_MS = 10 * 60 * 1000;
-const REPLAY_MOUSEMOVE_SAMPLING_MS = 120;
 const REPLAY_IDLE_START_DELAY_MS = 500;
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const SESSION_STORAGE_KEY = "trackion.session";
+
+function createDebugLogger(enabled: boolean) {
+  return {
+    log: (message: string, data?: unknown) => {
+      if (enabled) {
+        console.log(`[Trackion] ${message}`, data ? data : "");
+      }
+    },
+    error: (message: string, error?: unknown) => {
+      if (enabled) {
+        console.error(`[Trackion] ${message}`, error ? error : "");
+      }
+    },
+    warn: (message: string, data?: unknown) => {
+      if (enabled) {
+        console.warn(`[Trackion] ${message}`, data ? data : "");
+      }
+    },
+  };
+}
 
 let cachedUTMSearch = "";
 let cachedUTM: Required<TrackionUTMContext> = {
@@ -147,21 +165,6 @@ type ReplayConfig = {
   enabled: boolean;
   sampleRate: number;
 };
-
-type ReplayControl = {
-  start: () => void;
-  stop: () => void;
-};
-
-type RRWebEmit = (event: unknown) => void;
-type RRWebStopFn = () => void;
-type RRWebRecordFn = (options: {
-  emit: RRWebEmit;
-  maskAllInputs: boolean;
-  blockClass: string;
-  maskTextClass: string;
-  sampling: { mousemove: boolean | number };
-}) => RRWebStopFn;
 
 function randomId(): string {
   if (
@@ -301,21 +304,6 @@ async function postBatch(
   }
 }
 
-async function postReplay(
-  serverUrl: string,
-  apiKey: string,
-  payload: ReplayPayload,
-): Promise<void> {
-  const endpoint = `${serverUrl}/replay`;
-  const response = await postJSON(endpoint, apiKey, payload);
-
-  if (!response.ok) {
-    throw new Error(
-      `Trackion SDK: replay request failed with status ${response.status}`,
-    );
-  }
-}
-
 async function postJSON(
   endpoint: string,
   apiKey: string,
@@ -333,199 +321,6 @@ async function postJSON(
   });
 }
 
-class ReplayRecorder {
-  private readonly apiKey: string;
-  private readonly serverUrl: string;
-  private readonly getSessionId: () => string;
-  private readonly config: ReplayConfig;
-
-  private buffer: unknown[] = [];
-  private flushTimer: ReturnType<typeof setInterval> | null = null;
-  private stopRecording: RRWebStopFn | null = null;
-  private maxDurationTimer: ReturnType<typeof setTimeout> | null = null;
-  private flushing = false;
-  private started = false;
-  private sampledIn = false;
-  private loading = false;
-  private limitWindowStartedAt = 0;
-  private limitReached = false;
-  private activeSessionId = "";
-
-  constructor(options: {
-    apiKey: string;
-    serverUrl: string;
-    getSessionId: () => string;
-    config: ReplayConfig;
-  }) {
-    this.apiKey = options.apiKey;
-    this.serverUrl = options.serverUrl;
-    this.getSessionId = options.getSessionId;
-    this.config = options.config;
-  }
-
-  start(): void {
-    const sessionId = this.getSessionId();
-    this._syncSessionState(sessionId);
-
-    if (this.started || !this._canStart() || this.limitReached) {
-      return;
-    }
-
-    if (!this.sampledIn) {
-      this.sampledIn = Math.random() < this.config.sampleRate;
-    }
-
-    if (!this.sampledIn || this.loading) {
-      return;
-    }
-
-    this.loading = true;
-    void this._startRecorder().finally(() => {
-      this.loading = false;
-    });
-  }
-
-  stop(): void {
-    if (this.stopRecording) {
-      this.stopRecording();
-      this.stopRecording = null;
-    }
-
-    if (this.maxDurationTimer) {
-      clearTimeout(this.maxDurationTimer);
-      this.maxDurationTimer = null;
-    }
-
-    if (this.flushTimer) {
-      clearInterval(this.flushTimer);
-      this.flushTimer = null;
-    }
-
-    void this.flush();
-    this.started = false;
-  }
-
-  async flush(): Promise<void> {
-    if (this.flushing || this.buffer.length === 0) {
-      return Promise.resolve();
-    }
-
-    this.flushing = true;
-
-    const events = this.buffer.splice(0, this.buffer.length);
-    const payload: ReplayPayload = {
-      project_key: this.apiKey,
-      session_id: this.getSessionId(),
-      events,
-    };
-
-    try {
-      try {
-        return await postReplay(this.serverUrl, this.apiKey, payload);
-      } catch {
-        // Requeue failed events ahead of newly captured ones.
-        this.buffer = events.concat(this.buffer);
-      }
-    } finally {
-      this.flushing = false;
-      if (this.started && this.buffer.length > 0) {
-        void this.flush();
-      }
-    }
-  }
-
-  private _canStart(): boolean {
-    return (
-      this.config.enabled &&
-      typeof window !== "undefined" &&
-      typeof document !== "undefined"
-    );
-  }
-
-  private async _startRecorder(): Promise<void> {
-    const record = await this._loadRecord();
-    if (!record || this.stopRecording) {
-      return;
-    }
-
-    const remainingMs = this._remainingLimitMs();
-    if (remainingMs <= 0) {
-      this.limitReached = true;
-      return;
-    }
-
-    this.stopRecording = record({
-      emit: (event) => {
-        if (this._remainingLimitMs() <= 0) {
-          this._stopForLimit();
-          return;
-        }
-
-        this.buffer.push(event);
-        if (this.buffer.length > REPLAY_MAX_BUFFER_EVENTS) {
-          this.buffer.splice(0, this.buffer.length - REPLAY_MAX_BUFFER_EVENTS);
-        }
-      },
-      maskAllInputs: true,
-      blockClass: "trk-block",
-      maskTextClass: "trk-mask",
-      sampling: {
-        mousemove: REPLAY_MOUSEMOVE_SAMPLING_MS,
-      },
-    });
-
-    this.flushTimer = setInterval(() => {
-      void this.flush();
-    }, REPLAY_FLUSH_INTERVAL_MS);
-
-    this.maxDurationTimer = setTimeout(() => {
-      this._stopForLimit();
-    }, remainingMs);
-
-    this.started = true;
-  }
-
-  private _syncSessionState(sessionId: string): void {
-    if (this.activeSessionId === sessionId) {
-      return;
-    }
-
-    this.activeSessionId = sessionId;
-    this.sampledIn = false;
-    this.limitReached = false;
-    this.limitWindowStartedAt = 0;
-  }
-
-  private _remainingLimitMs(): number {
-    if (!this.limitWindowStartedAt) {
-      this.limitWindowStartedAt = Date.now();
-    }
-
-    const elapsed = Date.now() - this.limitWindowStartedAt;
-    return Math.max(0, REPLAY_MAX_DURATION_MS - elapsed);
-  }
-
-  private _stopForLimit(): void {
-    if (this.limitReached) {
-      return;
-    }
-
-    this.limitReached = true;
-    this.stop();
-  }
-
-  private async _loadRecord(): Promise<RRWebRecordFn | null> {
-    try {
-      const rrweb = (await import("rrweb")) as {
-        record?: RRWebRecordFn;
-      };
-      return rrweb.record || null;
-    } catch {
-      return null;
-    }
-  }
-}
-
 export class TrackionClient {
   private readonly enabled: boolean;
   private readonly apiKey: string;
@@ -535,6 +330,8 @@ export class TrackionClient {
   private readonly flushIntervalMs: number;
   private readonly runtimeTTLms: number;
   private readonly runtimeStorageKey: string;
+  private readonly replayEnabled: boolean;
+  private readonly debug: ReturnType<typeof createDebugLogger>;
   private readonly replayRecorder: ReplayRecorder;
   private readonly deviceInfo = getEventDeviceInfo();
   private readonly userAgent =
@@ -582,7 +379,7 @@ export class TrackionClient {
       throw new Error("Trackion SDK: apiKey is required");
     }
 
-    this.enabled = options.enabled || true;
+    this.enabled = options.enabled !== false;
     this.apiKey = options.apiKey;
     this.serverUrl = normalizeServerUrl(
       options.serverUrl || "https://api.trackion.tech",
@@ -604,6 +401,9 @@ export class TrackionClient {
     this.userId =
       typeof options.userId === "string" ? options.userId.trim() : "";
 
+    this.debug = createDebugLogger(options.debug ?? false);
+    this.debug.log("Client initialized", { apiKey: this.apiKey });
+
     const replayConfig: ReplayConfig = {
       enabled: Boolean(options.replay?.enabled),
       sampleRate:
@@ -612,6 +412,7 @@ export class TrackionClient {
           ? Math.max(0, Math.min(1, options.replay.sampleRate))
           : DEFAULT_REPLAY_SAMPLE_RATE,
     };
+    this.replayEnabled = replayConfig.enabled;
 
     this.sessionId = getOrCreateSessionId(options.sessionId);
     this.runtimeStorageKey = this.apiKey
@@ -623,6 +424,7 @@ export class TrackionClient {
       serverUrl: this.serverUrl,
       getSessionId: () => this.sessionId,
       config: replayConfig,
+      debug: (msg, data) => this.debug.log(`[Replay] ${msg}`, data),
     });
     this.replay = {
       start: () => {
@@ -682,6 +484,7 @@ export class TrackionClient {
   start(): void {
     if (this.started) return;
     this.started = true;
+    this.debug.log("Client started");
 
     this.pageStartedAt = Date.now();
     this.timer = setInterval(() => {
@@ -702,7 +505,9 @@ export class TrackionClient {
       document.addEventListener("click", this._onTrackedClick);
     }
 
-    this._scheduleReplayStart();
+    if (this.replayEnabled) {
+      this._scheduleReplayStart();
+    }
 
     if (this._getTrackingConfig().autoPageview) {
       this.page();
@@ -717,6 +522,7 @@ export class TrackionClient {
   }
 
   shutdown(): void {
+    this.debug.log("Client shutting down");
     if (this.replayStartTimer) {
       clearTimeout(this.replayStartTimer);
       this.replayStartTimer = null;
@@ -768,11 +574,13 @@ export class TrackionClient {
       throw new Error("Trackion SDK: sessionId must be a non-empty string");
     }
 
+    this.debug.log(`Session ID set to ${nextSessionId}`);
     this.sessionId = nextSessionId;
     persistSessionId(this.sessionId);
   }
 
   setUserId(userId: string): void {
+    this.debug.log(`User ID set to ${userId}`);
     this.userId = typeof userId === "string" ? userId.trim() : "";
   }
 
@@ -788,6 +596,7 @@ export class TrackionClient {
     if (!eventName || typeof eventName !== "string") {
       throw new Error("Trackion SDK: event name must be a non-empty string");
     }
+    this.debug.log(`Track event: ${eventName}`, properties);
 
     const page = getCurrentPage();
     const utm = getCurrentUTM();
@@ -882,9 +691,11 @@ export class TrackionClient {
     try {
       // Normalize the error
       const normalized = normalizeError(error);
+      this.debug.log("Capturing error", normalized.message);
 
       // Check if we should ignore this error
       if (shouldIgnoreError(normalized)) {
+        this.debug.log("Error ignored");
         return;
       }
 
@@ -965,7 +776,7 @@ export class TrackionClient {
       });
     } catch (captureError) {
       // Never throw errors from error capture - fail silently
-      console.error("[Trackion] Failed to capture error:", captureError);
+      this.debug.error("Failed to capture error", captureError);
     }
   }
 
@@ -978,10 +789,15 @@ export class TrackionClient {
 
     this.flushing = true;
     const chunk = this.queue.slice(0, this.batchSize);
+    this.debug.log(`Flushing ${chunk.length} events`);
 
     try {
       await postBatch(this.serverUrl, this.apiKey, chunk, useBeacon);
+      this.debug.log(`Flushed ${chunk.length} events successfully`);
       this.queue.splice(0, chunk.length);
+    } catch (err) {
+      this.debug.error("Flush failed", err);
+      throw err;
     } finally {
       this.flushing = false;
     }
@@ -992,8 +808,10 @@ export class TrackionClient {
   }: RefreshRuntimeOptions = {}): Promise<RuntimePayload> {
     const now = Date.now();
     if (!force && now - this.runtimeFetchedAt < this.runtimeTTLms) {
+      this.debug.log("Runtime cache hit");
       return this.runtime;
     }
+    this.debug.log("Refreshing runtime");
 
     const runtimeUrl = new URL(`${this.serverUrl}/v1/runtime`);
 
@@ -1001,37 +819,50 @@ export class TrackionClient {
       runtimeUrl.searchParams.set("user_id", this.userId);
     }
 
-    const response = await fetch(runtimeUrl.toString(), {
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.apiKey}`,
-      },
-    });
+    try {
+      const response = await fetch(runtimeUrl.toString(), {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.apiKey}`,
+        },
+      });
 
-    if (!response.ok) {
-      throw new Error(
-        `Trackion SDK: runtime request failed with status ${response.status}`,
-      );
+      if (!response.ok) {
+        this.debug.error(
+          `Runtime request failed with status ${response.status}`,
+        );
+        throw new Error(
+          `Trackion SDK: runtime request failed with status ${response.status}`,
+        );
+      }
+
+      const payload: { status?: boolean; data?: RuntimePayload } =
+        await response.json();
+      if (!payload.status) {
+        this.debug.error("Runtime response is invalid");
+        throw new Error("Trackion SDK: runtime response is invalid");
+      }
+
+      const data = payload.data || { flags: {}, config: {} };
+      this.runtime = {
+        flags: data.flags || {},
+        config: data.config || {},
+      };
+
+      this.runtimeFetchedAt = now;
+      this._persistRuntimeToStorage();
+      this._emitRuntimeUpdate();
+      this.debug.log("Runtime refreshed", {
+        flags: Object.keys(this.runtime.flags),
+        config: Object.keys(this.runtime.config),
+      });
+
+      return this.runtime;
+    } catch (err) {
+      this.debug.error("Runtime refresh failed", err);
+      throw err;
     }
-
-    const payload: { status?: boolean; data?: RuntimePayload } =
-      await response.json();
-    if (!payload.status) {
-      throw new Error("Trackion SDK: runtime response is invalid");
-    }
-
-    const data = payload.data || { flags: {}, config: {} };
-    this.runtime = {
-      flags: data.flags || {},
-      config: data.config || {},
-    };
-
-    this.runtimeFetchedAt = now;
-    this._persistRuntimeToStorage();
-    this._emitRuntimeUpdate();
-
-    return this.runtime;
   }
 
   subscribeRuntime(listener: RuntimeListener): () => void {

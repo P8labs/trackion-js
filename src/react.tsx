@@ -26,19 +26,26 @@ export interface TrackionProviderProps {
 
 export function TrackionProvider({ options, children }: TrackionProviderProps) {
   const clientRef = useRef<TrackionClient | null>(null);
-
-  if (!clientRef.current) {
-    clientRef.current = createTrackionClient(options);
-  }
+  const [client, setClient] = useState<TrackionClient | null>(null);
 
   useEffect(() => {
+    // Only create client once on mount
+    if (!clientRef.current) {
+      clientRef.current = createTrackionClient(options);
+      setClient(clientRef.current);
+    }
+
+    // Cleanup on unmount
     return () => {
-      clientRef.current?.shutdown();
+      if (clientRef.current) {
+        clientRef.current.shutdown();
+        clientRef.current = null;
+      }
     };
-  }, []);
+  }, []); // Empty dependency array ensures this runs once on mount/unmount only
 
   return (
-    <TrackionContext.Provider value={clientRef.current}>
+    <TrackionContext.Provider value={client}>
       {children}
     </TrackionContext.Provider>
   );
