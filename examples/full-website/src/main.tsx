@@ -4,7 +4,6 @@ import ReactDOM from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import { TrackionProvider } from "@trackion/js/react";
 import App from "./App.tsx";
-import "./index.css";
 
 class ErrorBoundary extends React.Component<
   { children: React.ReactNode; fallback: React.ReactNode },
@@ -74,16 +73,17 @@ const trackionConfig: TrackionClientOptions = {
   replay: {
     enabled: true,
   },
+  debug: true,
 };
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <BrowserRouter>
-      <ErrorBoundary fallback={<ErrorFallback />}>
-        <TrackionProvider options={trackionConfig}>
+      <TrackionProvider options={trackionConfig}>
+        <ErrorBoundary fallback={<ErrorFallback />}>
           <App />
-        </TrackionProvider>
-      </ErrorBoundary>
+        </ErrorBoundary>
+      </TrackionProvider>
     </BrowserRouter>
   </React.StrictMode>,
 );

@@ -43,7 +43,7 @@ async function postReplay(
       "X-Project-Key": apiKey,
     },
     body: JSON.stringify(payload),
-    keepalive: true,
+    keepalive: false, // We will handle retries in the ReplayRecorder, so we don't want the browser to automatically retry on page unload
   });
 
   if (!response.ok) {
@@ -151,7 +151,8 @@ export class ReplayRecorder {
     this.flushing = true;
     this.lastRetryTime = now;
 
-    const events = this.buffer.splice(0, this.buffer.length);
+    const MAX_EVENTS_PER_BATCH = 500;
+    const events = this.buffer.splice(0, MAX_EVENTS_PER_BATCH);
     const payload: ReplayPayload = {
       project_key: this.apiKey,
       session_id: this.getSessionId(),
